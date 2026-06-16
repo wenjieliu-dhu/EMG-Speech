@@ -25,6 +25,7 @@ diffwave/model/
 *.npy
 *.npz
 *.wav
+!docs/audio/**/*.wav
 *.flac
 *.mp3
 *.pkl

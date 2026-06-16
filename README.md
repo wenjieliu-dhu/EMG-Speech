@@ -14,6 +14,7 @@ This public repository intentionally excludes model checkpoints, generated audio
 - `strong_watermark_baselines.py`: traditional watermarking baselines.
 - `diffwave/`: DiffWave source code used by the experiments. Pretrained weights are not included.
 - `audioseal-main/` and `wavmark-main/`: baseline implementations used for comparison.
+- `docs/`: static audio demo page with selected listening samples.
 
 ## Environment
 
