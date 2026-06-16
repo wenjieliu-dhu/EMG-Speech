@@ -1,0 +1,50 @@
+# Python cache and local environments
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+
+# IDE and OS metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Model checkpoints and weights
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.h5
+checkpoints*/
+diffwave/model/
+
+# Generated data, audio, and experiment outputs
+*.npy
+*.npz
+*.wav
+*.flac
+*.mp3
+*.pkl
+*.pickle
+mels*/
+mels_soft_npy/
+gt_wav/
+results/
+tmp/
+.cache/
+
+# Paper/build artifacts
+*.aux
+*.log
+*.out
+*.synctex.gz
+*.pdf
+main.tex
+response_letter.*
+refs.bib
+
+# Local manifests produced from private data
+input_manifest_*.csv

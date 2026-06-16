@@ -1,0 +1,16 @@
+numpy
+pandas
+scipy
+torch
+torchaudio
+tqdm
+librosa
+soundfile
+scikit-image
+jiwer
+pesq
+pystoi
+torch-pesq
+julius
+wandb
+openai-whisper

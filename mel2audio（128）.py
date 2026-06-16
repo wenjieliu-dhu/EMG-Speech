@@ -1,0 +1,326 @@
+# Copyright 2020 LMNT, Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
+import numpy as np
+import os
+import torch
+import torchaudio
+
+from argparse import ArgumentParser
+
+from diffwave.params import AttrDict, params as base_params
+from diffwave.model import DiffWave
+
+
+models = {}
+# --- Fix: auto-detect and correct spectrogram transpose (n_mels, T) vs (T, n_mels) ---
+def _maybe_fix_spectrogram_shape(spectrogram: torch.Tensor, n_mels: int) -> torch.Tensor:
+  """Ensure spectrogram is shaped as (n_mels, T) or (B, n_mels, T).
+
+  Many pipelines save as (T, n_mels) / (B, T, n_mels). If detected, we transpose it.
+  """
+  if spectrogram is None:
+    return spectrogram
+  if not torch.is_tensor(spectrogram):
+    spectrogram = torch.as_tensor(spectrogram)
+
+  # 2D: (n_mels, T) or (T, n_mels)
+  if spectrogram.ndim == 2:
+    if spectrogram.shape[0] == n_mels:
+      return spectrogram
+    if spectrogram.shape[1] == n_mels:
+      return spectrogram.transpose(0, 1).contiguous()
+    return spectrogram
+
+  # 3D: (B, n_mels, T) or (B, T, n_mels)
+  if spectrogram.ndim == 3:
+    if spectrogram.shape[1] == n_mels:
+      return spectrogram
+    if spectrogram.shape[2] == n_mels:
+      return spectrogram.permute(0, 2, 1).contiguous()
+    return spectrogram
+
+  return spectrogram
+
+
+def predict(spectrogram=None, model_dir=None, params=None, device=torch.device('cuda'), fast_sampling=False):
+  # Lazy load model.
+  if not model_dir in models:
+    if os.path.exists(f'{model_dir}/diffwave.pt'):
+      checkpoint = torch.load(f'{model_dir}/diffwave.pt')
+    else:
+      checkpoint = torch.load(model_dir)
+    model = DiffWave(AttrDict(base_params)).to(device)
+    model.load_state_dict(checkpoint['model'])
+    model.eval()
+    models[model_dir] = model
+
+  model = models[model_dir]
+  model.params.override(params)
+  with torch.no_grad():
+    # Change in notation from the DiffWave paper for fast sampling.
+    # DiffWave paper -> Implementation below
+    # --------------------------------------
+    # alpha -> talpha
+    # beta -> training_noise_schedule
+    # gamma -> alpha
+    # eta -> beta
+    training_noise_schedule = np.array(model.params.noise_schedule)
+    inference_noise_schedule = np.array(model.params.inference_noise_schedule) if fast_sampling else training_noise_schedule
+
+    talpha = 1 - training_noise_schedule
+    talpha_cum = np.cumprod(talpha)
+
+    beta = inference_noise_schedule
+    alpha = 1 - beta
+    alpha_cum = np.cumprod(alpha)
+
+    T = []
+    for s in range(len(inference_noise_schedule)):
+      for t in range(len(training_noise_schedule) - 1):
+        if talpha_cum[t+1] <= alpha_cum[s] <= talpha_cum[t]:
+          twiddle = (talpha_cum[t]**0.5 - alpha_cum[s]**0.5) / (talpha_cum[t]**0.5 - talpha_cum[t+1]**0.5)
+          T.append(t + twiddle)
+          break
+    T = np.array(T, dtype=np.float32)
+
+
+    if not model.params.unconditional:
+      spectrogram = _maybe_fix_spectrogram_shape(spectrogram, int(model.params.n_mels))
+      if len(spectrogram.shape) == 2:# Expand rank 2 tensors by adding a batch dimension.
+        spectrogram = spectrogram.unsqueeze(0)
+      spectrogram = spectrogram.to(device)
+      audio = torch.randn(spectrogram.shape[0], model.params.hop_samples * spectrogram.shape[-1], device=device)
+    else:
+      audio = torch.randn(1, params.audio_len, device=device)
+    noise_scale = torch.from_numpy(alpha_cum**0.5).float().unsqueeze(1).to(device)
+
+    for n in range(len(alpha) - 1, -1, -1):
+      c1 = 1 / alpha[n]**0.5
+      c2 = beta[n] / (1 - alpha_cum[n])**0.5
+      audio = c1 * (audio - c2 * model(audio, diffusion_step=torch.tensor([T[n]], device=audio.device), spectrogram=spectrogram).squeeze(1))
+      if n > 0:
+        noise = torch.randn_like(audio)
+        sigma = ((1.0 - alpha_cum[n-1]) / (1.0 - alpha_cum[n]) * beta[n])**0.5
+        audio += sigma * noise
+      audio = torch.clamp(audio, -1.0, 1.0)
+  return audio, model.params.sample_rate
+
+
+def main(args):
+  if args.spectrogram_path:
+    spectrogram = torch.from_numpy(np.load(args.spectrogram_path))
+  else:
+    spectrogram = None
+  audio, sr = predict(spectrogram, model_dir=args.model_dir, fast_sampling=args.fast, params=base_params)
+  torchaudio.save(args.output, audio.cpu(), sample_rate=sr)
+
+
+if __name__ == '__main__':
+  parser = ArgumentParser(description='runs inference on a spectrogram file generated by diffwave.preprocess')
+  parser.add_argument('--model_dir',
+      help='directory containing a trained model (or full path to weights.pt file)',default='/home/xlt/fy/diffwave-master/src/diffwave/model')
+  parser.add_argument('--spectrogram_path', '-s',
+      help='path to a spectrogram file generated by diffwave.preprocess',default='/home/xlt/fy/data/LJSpeech-1.1/test/LJ001-0001.wav.spec.npy')
+  parser.add_argument('--output', '-o', default='output.wav',
+      help='output file name')
+  parser.add_argument('--fast', '-f', action='store_true',
+      help='fast sampling procedure')
+  args = parser.parse_args()
+
+  # ===========================
+  # Baseline vs. Watermark demo
+  # ===========================
+  # If you run without CLI args, we auto-fallback to your project paths below.
+  DEFAULT_BASELINE_CKPT = r"E:\postgraduate\project\EMG-Speech\checkpoints（128）\diffwave.pt"
+  DEFAULT_MASK_CKPT     = r"E:\postgraduate\project\EMG-Speech\checkpoints（128）\diffwave_mask_epoch_2.pth"
+  DEFAULT_WM_CKPT       = r"E:\postgraduate\project\EMG-Speech\checkpoints（128）\diffwave-watermark_epoch_129.pth"
+  DEFAULT_SPEC          = r"E:\postgraduate\project\EMG-Speech\mels(16000)\LJ001-0002.wav.spec.npy" 
+
+  # Fixed payload bits (edit freely).
+  WM_BITS = "10110010"  # length should match finger_dim
+  FINGER_DIM = 8
+
+  # For fair comparison, we force the same RNG seed for baseline and watermark.
+  RNG_SEED = 1234
+
+  # If default args paths do not exist, fallback to your provided paths (no CLI required).
+  if (not args.model_dir) or (not os.path.exists(args.model_dir)):
+    if os.path.exists(DEFAULT_BASELINE_CKPT):
+      args.model_dir = DEFAULT_BASELINE_CKPT
+  if (not args.spectrogram_path) or (not os.path.exists(args.spectrogram_path)):
+    if os.path.exists(DEFAULT_SPEC):
+      args.spectrogram_path = DEFAULT_SPEC
+
+  # Output directory + naming: follow spectrogram/mel filename
+  RESULTS_DIR = r"E:\postgraduate\project\EMG-Speech\results"
+  os.makedirs(RESULTS_DIR, exist_ok=True)
+
+  def _spec_stem(spec_path: str) -> str:
+    name = os.path.basename(spec_path)
+    if name.endswith(".npy"):
+      name = name[:-4]  # remove .npy, keep e.g. LJ001-0001.wav.spec
+    return name
+
+  spec_stem = _spec_stem(args.spectrogram_path)
+  baseline_output = os.path.join(RESULTS_DIR, f"{spec_stem}_baseline.wav")
+  wm_output_fixed = os.path.join(RESULTS_DIR, f"{spec_stem}_wm.wav")
+
+  # Use mel/spec-based names (ignore --output), but do not change baseline saving logic.
+  args.output = baseline_output
+
+  def _set_seed(seed: int):
+    torch.manual_seed(seed)
+    try:
+      torch.cuda.manual_seed_all(seed)
+    except Exception:
+      pass
+    np.random.seed(seed)
+  # ---------------------------
+  # 1) Generate baseline audio
+  # ---------------------------
+  _set_seed(RNG_SEED)
+  main(args)  # baseline inference (original pipeline)
+
+  # ---------------------------
+  # 2) Generate watermark audio
+  # ---------------------------
+  # watermark injection uses forward_pre_hook with a global `fingerprint` tensor
+  global fingerprint
+  fingerprint = None
+
+  def hook_fn(module, hook_args):
+    # Feed (x, fingerprint) into fingerprint layers.
+    # Make sure fingerprint is on the same device as x to avoid CPU/CUDA mismatch.
+    x = hook_args[0]
+    fp = fingerprint
+    if fp is None:
+      raise RuntimeError("fingerprint is None. Set global `fingerprint` before calling the watermark model.")
+    if fp.device != x.device:
+      fp = fp.to(x.device)
+    return [x, fp]
+
+  def _bits_to_fingerprint(bits: str, device: torch.device, finger_dim: int = 16, batch: int = 1) -> torch.Tensor:
+    bits = "".join([c for c in bits.strip() if c in "01"])
+    if len(bits) < finger_dim:
+      bits = bits + ("0" * (finger_dim - len(bits)))
+    if len(bits) > finger_dim:
+      bits = bits[:finger_dim]
+    vec = torch.tensor([float(c) for c in bits], dtype=torch.float32, device=device).unsqueeze(0)
+    if batch > 1:
+      vec = vec.repeat(batch, 1)
+    return vec
+
+  def _build_watermarked_model(device: torch.device):
+    import torch.nn as nn
+    from base_network import get_mask_conv, get_fingerprint
+    from utils import load_model_state
+
+    # 2.1 Load the original DiffWave weights
+    ori_ckpt = torch.load(DEFAULT_BASELINE_CKPT, map_location=device)
+    wm_model = DiffWave(AttrDict(base_params)).to(device)
+    wm_model.load_state_dict(ori_ckpt["model"])
+    wm_model.eval()
+
+    for p in wm_model.parameters():
+      p.requires_grad = False
+
+    # 2.2 Replace the last 5 `output_projection` Conv1d layers with mask conv
+    output_layers = []
+    for name, layer in reversed(list(wm_model.named_modules())):
+      if isinstance(layer, nn.Conv1d) and ("output_projection" in name):
+        output_layers.append((name, layer))
+        if len(output_layers) == 5:
+          break
+    if len(output_layers) < 5:
+      raise ValueError("Not enough output_projection layers to embed watermark (need 5).")
+
+    for name, _layer in output_layers:
+      parts = name.split(".")
+      temp = wm_model
+      for i, part in enumerate(parts):
+        if i == len(parts) - 1:
+          setattr(temp, part, get_mask_conv(getattr(temp, part), device))
+        else:
+          temp = getattr(temp, part)
+
+    # 2.3 Load the trained mask weights
+    mask_state = torch.load(DEFAULT_MASK_CKPT, map_location=device)
+    wm_model = load_model_state(wm_model, mask_state)
+
+    for p in wm_model.parameters():
+      p.requires_grad = False
+
+    # 2.4 Replace mask conv with fingerprint conv
+    for name, layer in reversed(list(wm_model.named_modules())):
+      if isinstance(layer, get_mask_conv):
+        parts = name.split(".")
+        temp = wm_model
+        for i, part in enumerate(parts):
+          if i == len(parts) - 1:
+            setattr(temp, part, get_fingerprint(getattr(temp, part), FINGER_DIM))
+          else:
+            temp = getattr(temp, part)
+
+    # 2.5 Initialize watermark masks and apply threshold (follow training pipeline)
+    from base_network import get_fingerprint as _GF
+    for _name, layer in reversed(list(wm_model.named_modules())):
+      if isinstance(layer, _GF):
+        if hasattr(layer, "set_mask"):
+          layer.set_mask()
+        if hasattr(layer, "w_mask"):
+          layer.w_mask[layer.w_mask < 3] = 0
+
+    # IMPORTANT: get_fingerprint modules are created on CPU by default.
+    # Move the whole model to target device after replacement to avoid CPU/CUDA mismatch.
+    wm_model = wm_model.to(device)
+    wm_model.eval()
+
+    # 2.6 Load the trained watermark model weights (state_dict)
+    wm_state = torch.load(DEFAULT_WM_CKPT, map_location=device)
+    wm_model.load_state_dict(wm_state)
+    wm_model = wm_model.to(device)
+    wm_model.eval()
+
+    # 2.7 Register watermark hook
+    from base_network import get_fingerprint as _GF
+    for _name, layer in wm_model.named_modules():
+      if isinstance(layer, _GF):
+        layer.register_forward_pre_hook(hook_fn)
+
+    return wm_model
+
+  # Device follows original default; keep consistent with baseline predict().
+  device = torch.device("cuda")
+
+  # Build and cache watermark model under an internal key so it won't touch baseline cache
+  wm_key = "__WATERMARK_MODEL__"
+  if wm_key not in models:
+    models[wm_key] = _build_watermarked_model(device)
+
+  # Prepare fingerprint (batch=1 for this script)
+  fingerprint = _bits_to_fingerprint(WM_BITS, device=device, finger_dim=FINGER_DIM, batch=1)
+
+  # Run watermark sampling with the same RNG seed
+  _set_seed(RNG_SEED)
+  spectrogram = torch.from_numpy(np.load(args.spectrogram_path))
+  audio_wm, sr = predict(spectrogram, model_dir=wm_key, fast_sampling=args.fast, params=base_params, device=device)
+
+  wm_output = wm_output_fixed
+  torchaudio.save(wm_output, audio_wm.cpu(), sample_rate=sr)
+
+  print(f"[DONE] baseline: {args.output}")
+  print(f"[DONE] watermark: {wm_output}")
+
